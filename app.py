@@ -1,11 +1,12 @@
 import time
 import random
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objs as go
 import streamlit as st
 
 # Simple AI-based Robot Monitoring Demo (single-file)
@@ -14,25 +15,37 @@ import streamlit as st
 
 NUM_ROBOTS = 20
 HISTORY_LENGTH = 60
+PROBLEM_ROBOTS = {"R007", "R012", "R015"}
+AI_RISK_RULES = {
+    "temperature": {"threshold": 80, "label": "Temperature"},
+    "vibration": {"threshold": 70, "label": "Vibration"},
+    "torque": {"threshold": 85, "label": "Torque"},
+}
 
 
 def init_session():
     if "robots" not in st.session_state:
         robots = []
         for i in range(1, NUM_ROBOTS + 1):
+            robot_id = f"R{i:03d}"
             base_temp = random.uniform(55, 75)
             base_torque = random.uniform(45, 70)
             base_speed = random.uniform(900, 1400)
             base_vib = random.uniform(15, 40)
             runtime_hours = random.uniform(100, 2000)
             r = {
-                "id": f"Robot-{i:02d}",
+                "robot_id": robot_id,
+                "id": robot_id,
                 "temperature": base_temp,
                 "torque": base_torque,
                 "speed": base_speed,
                 "vibration": base_vib,
                 "runtime_hours": runtime_hours,
                 "status": "Healthy",
+                "health_score": 100,
+                "risk_score": 0,
+                "predicted_failure_probability": 5,
+                "alert_summary": "None",
                 "alarms": 0,
                 "history": {
                     "ts": deque(maxlen=HISTORY_LENGTH),
@@ -51,6 +64,11 @@ def init_session():
                 r["history"]["torque"].append(base_torque + random.uniform(-1.5, 1.5))
                 r["history"]["speed"].append(base_speed + random.uniform(-10, 10))
                 r["history"]["vibration"].append(base_vib + random.uniform(-1, 1))
+            r["status"] = ai_health_check(r)
+            r["health_score"] = robot_health_score(r)
+            r["risk_score"] = robot_risk_score(r)
+            r["predicted_failure_probability"] = predicted_failure_probability(r)
+            r["alert_summary"] = robot_alert_summary(r)
             robots.append(r)
         st.session_state.robots = robots
         st.session_state.running = False
@@ -59,21 +77,49 @@ def init_session():
         st.session_state.avail_history = deque(maxlen=HISTORY_LENGTH)
         st.session_state.health_history = deque(maxlen=HISTORY_LENGTH)
         st.session_state.ts_history = deque(maxlen=HISTORY_LENGTH)
+        st.session_state.pred_failures_history = deque(maxlen=HISTORY_LENGTH)
+        st.session_state.active_alerts_history = deque(maxlen=HISTORY_LENGTH)
+        st.session_state.downtime_pct_history = deque(maxlen=HISTORY_LENGTH)
         st.session_state.interval = 2
         st.session_state.prediction_horizon = 60
+    if "robots" in st.session_state:
+        for r in st.session_state.robots:
+            r["status"] = ai_health_check(r)
+            r["health_score"] = robot_health_score(r)
+            r["risk_score"] = robot_risk_score(r)
+            r["predicted_failure_probability"] = predicted_failure_probability(r)
+            r["alert_summary"] = robot_alert_summary(r)
 
 
 def ai_health_check(robot):
-    # Business AI rules (simple thresholds)
-    temp = robot["temperature"]
-    vib = robot["vibration"]
-    torque = robot["torque"]
-    status = "Healthy"
-    if torque > 85:
-        status = "Critical"
-    elif temp > 80 or vib > 70:
-        status = "Warning"
-    return status
+    breaches = robot_risk_breaches(robot)
+    if len(breaches) >= 2:
+        return "Critical"
+    if len(breaches) == 1:
+        return "Warning"
+    return "Healthy"
+
+
+def robot_risk_breaches(robot):
+    breaches = []
+    for metric, rule in AI_RISK_RULES.items():
+        if robot[metric] > rule["threshold"]:
+            breaches.append(
+                {
+                    "metric": metric,
+                    "label": rule["label"],
+                    "value": robot[metric],
+                    "threshold": rule["threshold"],
+                }
+            )
+    return breaches
+
+
+def robot_alert_summary(robot):
+    breaches = robot_risk_breaches(robot)
+    if not breaches:
+        return "None"
+    return ", ".join(f"{b['label']} > {b['threshold']}" for b in breaches)
 
 
 def robot_health_score(robot):
@@ -82,11 +128,77 @@ def robot_health_score(robot):
     torque = robot["torque"]
     vib = robot["vibration"]
     score = 100.0
-    score -= max(0.0, (temp - 60.0) * 0.7)
-    score -= max(0.0, (torque - 55.0) * 0.6)
-    score -= max(0.0, (vib - 30.0) * 0.8)
-    score = np.clip(score, 20.0, 100.0)
+    score -= max(0.0, (temp - 60.0) * 0.8)
+    score -= max(0.0, (torque - 55.0) * 0.7)
+    score -= max(0.0, (vib - 30.0) * 0.9)
+    if temp > 80:
+        score -= (temp - 80) * 1.5
+    if vib > 70:
+        score -= (vib - 70) * 1.8
+    if torque > 85:
+        score -= (torque - 85) * 1.2
+    score -= max(0, len(robot_risk_breaches(robot)) - 1) * 12
+    score = np.clip(score, 10.0, 100.0)
     return int(score)
+
+
+def robot_risk_score(robot):
+    score = 0.0
+    score += min(40.0, max(0.0, (robot["temperature"] - 60.0) * 1.0))
+    score += min(30.0, max(0.0, (robot["torque"] - 55.0) * 0.8))
+    score += min(30.0, max(0.0, (robot["vibration"] - 30.0) * 0.9))
+    breaches = robot_risk_breaches(robot)
+    score += len(breaches) * 12.0
+    if len(breaches) >= 2:
+        score += 18.0
+    return int(np.clip(score, 0.0, 100.0))
+
+
+def predicted_failure_probability(robot):
+    ts_list = list(robot["history"]["ts"])
+    if len(ts_list) < 3:
+        base = 10
+        return int(np.clip(base + robot_risk_score(robot) * 0.4, 5, 95))
+    t0 = ts_list[0]
+    secs = np.array([(t - t0).total_seconds() for t in ts_list])
+    prob = 10.0
+    for metric, threshold, weight in [("temperature", 80, 1.1), ("vibration", 70, 1.2), ("torque", 85, 1.0)]:
+        vals = np.array(list(robot["history"][metric]))
+        if np.ptp(secs) > 0:
+            try:
+                slope, intercept = np.polyfit(secs, vals, 1)
+            except Exception:
+                slope = 0.0
+            current = float(vals[-1])
+            if current >= threshold:
+                prob += 25 * weight
+            elif slope > 0:
+                time_to_threshold = (threshold - current) / slope if slope > 0 else np.inf
+                if time_to_threshold < 60:
+                    prob += 25 * weight
+                elif time_to_threshold < 180:
+                    prob += 18 * weight
+                elif time_to_threshold < 600:
+                    prob += 12 * weight
+                elif time_to_threshold < 1800:
+                    prob += 8 * weight
+                else:
+                    prob += 4 * weight
+        else:
+            if robot[metric] > threshold:
+                prob += 20 * weight
+    prob += robot_risk_score(robot) * 0.2
+    return int(np.clip(prob, 5.0, 99.0))
+
+
+def trend_arrow(current, previous, positive_good=True):
+    if previous is None:
+        return ""
+    if current == previous:
+        return "→"
+    if current > previous:
+        return "⬆️" if positive_good else "⬇️"
+    return "⬇️" if positive_good else "⬆️"
 
 
 def update_robots(interval_seconds=2.0):
@@ -95,16 +207,29 @@ def update_robots(interval_seconds=2.0):
     critical_count = warning_count = 0
     for r in st.session_state.robots:
         # Small drift plus occasional spikes
-        r["temperature"] += random.uniform(-0.5, 0.8)
-        if random.random() < 0.02:
-            r["temperature"] += random.uniform(5, 15)  # spike
-        r["torque"] += random.uniform(-0.7, 0.7)
-        if random.random() < 0.015:
-            r["torque"] += random.uniform(10, 25)
+        r["temperature"] += random.uniform(-0.4, 0.8)
+        r["torque"] += random.uniform(-0.6, 0.6)
         r["speed"] += random.uniform(-10, 10)
-        r["vibration"] += random.uniform(-0.6, 0.6)
+        r["vibration"] += random.uniform(-0.5, 0.6)
+
+        # gradual degradation for problem robots
+        if r["id"] in PROBLEM_ROBOTS:
+            r["temperature"] += random.uniform(0.2, 0.8)
+            r["torque"] += random.uniform(0.4, 1.2)
+            r["vibration"] += random.uniform(0.2, 0.6)
+            if random.random() < 0.08:
+                r["temperature"] += random.uniform(0.5, 1.4)
+            if random.random() < 0.06:
+                r["torque"] += random.uniform(1.2, 3.5)
+            if random.random() < 0.08:
+                r["vibration"] += random.uniform(0.8, 2.0)
+
         if random.random() < 0.02:
-            r["vibration"] += random.uniform(5, 20)
+            r["temperature"] += random.uniform(4, 10)  # rare spike
+        if random.random() < 0.015:
+            r["torque"] += random.uniform(8, 18)
+        if random.random() < 0.02:
+            r["vibration"] += random.uniform(4, 12)
 
         # clamp sensible industrial ranges
         r["temperature"] = float(np.clip(r["temperature"], 20, 200))
@@ -123,9 +248,12 @@ def update_robots(interval_seconds=2.0):
         r["history"]["vibration"].append(r["vibration"])
 
         # AI logic
-        prev_status = r["status"]
         new_status = ai_health_check(r)
         r["status"] = new_status
+        r["health_score"] = robot_health_score(r)
+        r["risk_score"] = robot_risk_score(r)
+        r["predicted_failure_probability"] = predicted_failure_probability(r)
+        r["alert_summary"] = robot_alert_summary(r)
         if new_status != "Healthy":
             r["alarms"] += 1
             st.session_state.alarm_count += 1
@@ -150,10 +278,7 @@ def update_robots(interval_seconds=2.0):
 
     # Availability % (simple approximation)
     availability = max(0.0, 100.0 - (st.session_state.downtime_hours / max(1.0, sum(r['runtime_hours'] for r in st.session_state.robots)) * 100.0))
-    # Health score: scaled 0-100 (Healthy=100, Warning=60, Critical=20) average
-    score_map = {"Healthy": 100, "Warning": 60, "Critical": 20}
-    health_scores = [score_map[r["status"]] for r in st.session_state.robots]
-    health_score = float(np.mean(health_scores))
+    health_score = float(np.mean([r["health_score"] for r in st.session_state.robots]))
 
     st.session_state.avail_history.append(availability)
     st.session_state.health_history.append(health_score)
@@ -184,7 +309,9 @@ def predictive_assessment(horizon_seconds=60):
         t0 = ts_list[0]
         secs = np.array([(t - t0).total_seconds() for t in ts_list])
         # for each metric, fit linear slope
-        for metric, thresh, level_when_exceed in [("temperature", 80, "Warning"), ("vibration", 70, "Warning"), ("torque", 85, "Critical")]:
+        robot_alerts = []
+        for metric, rule in AI_RISK_RULES.items():
+            thresh = rule["threshold"]
             vals = np.array(list(r["history"][metric]))
             try:
                 # linear fit (degree 1) on time vs value
@@ -199,13 +326,12 @@ def predictive_assessment(horizon_seconds=60):
             except Exception:
                 predicted = float(vals[-1])
 
-            # check thresholds
-            if metric == "torque":
-                if predicted > thresh:
-                    alerts.append({"id": r["id"], "metric": metric, "predicted": predicted, "threshold": thresh, "level": "Critical"})
-            else:
-                if predicted > thresh:
-                    alerts.append({"id": r["id"], "metric": metric, "predicted": predicted, "threshold": thresh, "level": "Warning"})
+            if predicted > thresh:
+                robot_alerts.append({"id": r["id"], "metric": metric, "predicted": predicted, "threshold": thresh, "level": "Warning"})
+        if len(robot_alerts) >= 2:
+            for alert in robot_alerts:
+                alert["level"] = "Critical"
+        alerts.extend(robot_alerts)
     return alerts
 
 
@@ -216,7 +342,9 @@ def predict_robot_metrics(robot, horizon_seconds=60):
     t0 = ts_list[0]
     secs = np.array([(t - t0).total_seconds() for t in ts_list])
     predictions = {}
-    for metric, thresh, critical_if in [("temperature", 80, "Warning"), ("vibration", 70, "Warning"), ("torque", 85, "Critical")]:
+    predicted_breaches = []
+    for metric, rule in AI_RISK_RULES.items():
+        thresh = rule["threshold"]
         vals = np.array(list(robot["history"][metric]))
         predicted = float(vals[-1])
         if len(secs) >= 2 and np.ptp(secs) > 0:
@@ -227,17 +355,278 @@ def predict_robot_metrics(robot, horizon_seconds=60):
                 predicted = float(slope * (secs[-1] + horizon_seconds) + intercept)
             except Exception:
                 predicted = float(vals[-1])
-        level = "Healthy"
-        if metric == "torque" and predicted > thresh:
-            level = "Critical"
-        elif metric != "torque" and predicted > thresh:
-            level = "Warning"
+        level = "Warning" if predicted > thresh else "Healthy"
+        if predicted > thresh:
+            predicted_breaches.append(metric)
         predictions[metric] = {
             "predicted": predicted,
             "threshold": thresh,
             "level": level,
         }
+    if len(predicted_breaches) >= 2:
+        for metric in predicted_breaches:
+            predictions[metric]["level"] = "Critical"
     return predictions
+
+
+def style_plotly_chart(fig):
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(15,23,42,0.92)",
+        plot_bgcolor="rgba(17,24,39,0.95)",
+        font=dict(color="#e2e8f0", family="Inter, sans-serif"),
+        title=dict(x=0.01, xanchor="left", font=dict(size=18, color="#f8fafc")),
+        margin=dict(l=20, r=20, t=50, b=30),
+        legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor="rgba(255,255,255,0.08)", font=dict(color="#e2e8f0")),
+        hovermode="x unified",
+    )
+    if hasattr(fig, "update_xaxes"):
+        fig.update_xaxes(showgrid=True, gridcolor="rgba(148,163,184,0.12)", zeroline=False, showline=False, color="#cbd5e1")
+    if hasattr(fig, "update_yaxes"):
+        fig.update_yaxes(showgrid=True, gridcolor="rgba(148,163,184,0.12)", zeroline=False, showline=False, color="#cbd5e1")
+    return fig
+
+
+def build_gauge(title, value, min_val=0, max_val=100, threshold=None, suffix="", subtext=""):
+    steps = [
+        dict(range=[min_val, max_val * 0.4], color="#7f1d1d"),
+        dict(range=[max_val * 0.4, max_val * 0.75], color="#f59e0b"),
+        dict(range=[max_val * 0.75, max_val], color="#22c55e"),
+    ]
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number+delta",
+            value=value,
+            number=dict(suffix=suffix, font=dict(size=28, color="#f8fafc")),
+            delta=dict(reference=max_val, relative=False, position="top", font=dict(color="#94a3b8")),
+            gauge=dict(
+                axis=dict(range=[min_val, max_val], tickcolor="#cbd5e1"),
+                bar=dict(color="#38bdf8"),
+                steps=steps,
+                threshold=dict(line=dict(color="#facc15", width=4), thickness=0.75, value=threshold if threshold is not None else max_val * 0.75),
+            ),
+            title=dict(text=title, font=dict(size=16, color="#e2e8f0")),
+        )
+    )
+    if subtext:
+        fig.add_annotation(x=0.5, y=-0.15, text=subtext, showarrow=False, font=dict(color="#94a3b8", size=12))
+    style_plotly_chart(fig)
+    return fig
+
+
+def build_risk_ranking_chart(robots):
+    sorted_robots = sorted(robots, key=lambda r: (r["health_score"], r["temperature"]))
+    df = pd.DataFrame(
+        {
+            "Robot": [r["id"] for r in sorted_robots],
+            "Health Score": [r["health_score"] for r in sorted_robots],
+            "Status": [r["status"] for r in sorted_robots],
+        }
+    )
+    fig = px.bar(
+        df,
+        x="Robot",
+        y="Health Score",
+        color="Status",
+        color_discrete_map={"Healthy": "#22c55e", "Warning": "#f59e0b", "Critical": "#ef4444"},
+        title="Robot Health Ranking",
+    )
+    fig.update_traces(marker_line_color="#0f172a", marker_line_width=1)
+    style_plotly_chart(fig)
+    return fig
+
+
+def build_metric_trend_chart(ts, values, metric_name, y_label, color):
+    fig = px.line(
+        pd.DataFrame({"ts": ts, y_label: values}),
+        x="ts",
+        y=y_label,
+        title=f"{metric_name} Trend",
+    )
+    fig.update_traces(line=dict(color=color, width=3), hovertemplate="%{x}<br>%{y:.2f}")
+    style_plotly_chart(fig)
+    return fig
+
+
+def build_alarm_pie(robots):
+    counts = {
+        "Healthy": sum(1 for r in robots if r["status"] == "Healthy"),
+        "Warning": sum(1 for r in robots if r["status"] == "Warning"),
+        "Critical": sum(1 for r in robots if r["status"] == "Critical"),
+    }
+    df = pd.DataFrame({"Status": list(counts.keys()), "Count": list(counts.values())})
+    fig = px.pie(df, names="Status", values="Count", title="Alarm / Status Distribution", hole=0.45)
+    fig.update_traces(textposition="inside", textinfo="percent+label", marker=dict(colors=["#22c55e", "#f59e0b", "#ef4444"]))
+    style_plotly_chart(fig)
+    return fig
+
+
+def build_robot_health_bar(robots):
+    sorted_robots = sorted(robots, key=lambda r: r["health_score"])
+    df = pd.DataFrame(
+        {
+            "Robot": [r["id"] for r in sorted_robots],
+            "Health Score": [r["health_score"] for r in sorted_robots],
+            "Status": [r["status"] for r in sorted_robots],
+        }
+    )
+    fig = px.bar(
+        df,
+        x="Robot",
+        y="Health Score",
+        color="Status",
+        color_discrete_map={"Healthy": "#38bdf8", "Warning": "#f97316", "Critical": "#ef4444"},
+        title="Robot Health Score Bar Chart",
+    )
+    fig.update_traces(marker_line_width=0)
+    style_plotly_chart(fig)
+    return fig
+
+
+def build_downtime_trend(ts, downtime_history):
+    fig = px.area(
+        pd.DataFrame({"ts": ts, "Downtime %": downtime_history}),
+        x="ts",
+        y="Downtime %",
+        title="Downtime Trend",
+    )
+    fig.update_traces(fill="tozeroy", line=dict(color="#f97316", width=2), hovertemplate="%{x}<br>%{y:.2f}%")
+    style_plotly_chart(fig)
+    return fig
+
+
+def forecast_robot_metric(robot, metric, horizon_seconds=60, warning_threshold=None, critical_threshold=None, points=30):
+    ts_list = list(robot["history"]["ts"])
+    values = np.array(list(robot["history"][metric]))
+    if len(ts_list) < 3 or np.ptp(values) == 0:
+        return None
+    t0 = ts_list[0]
+    secs = np.array([(t - t0).total_seconds() for t in ts_list])
+    if len(secs) < 2 or np.ptp(secs) == 0:
+        return None
+    try:
+        slope, intercept = np.polyfit(secs, values, 1)
+    except Exception:
+        return None
+    now_sec = secs[-1]
+    future_secs = np.linspace(now_sec, now_sec + horizon_seconds, points)
+    future_times = [t0 + timedelta(seconds=float(s)) for s in future_secs]
+    predicted = intercept + slope * future_secs
+    residuals = values - (slope * secs + intercept)
+    sigma = float(np.std(residuals)) if len(residuals) > 1 else 1.0
+    band = np.clip(sigma * 1.8, 1.2, max(3.0, abs(predicted).max() * 0.05))
+    upper = predicted + band
+    lower = predicted - band
+    crossing_time = None
+    crossing_level = None
+    if slope > 0:
+        for future_time, future_value in zip(future_times, predicted):
+            if critical_threshold is not None and future_value >= critical_threshold:
+                crossing_time = future_time
+                crossing_level = "Critical"
+                break
+            if warning_threshold is not None and future_value >= warning_threshold and crossing_level is None:
+                crossing_time = future_time
+                crossing_level = "Warning"
+                break
+    risk_level = "Healthy"
+    if critical_threshold is not None and predicted[-1] >= critical_threshold:
+        risk_level = "Critical"
+    elif warning_threshold is not None and predicted[-1] >= warning_threshold:
+        risk_level = "Warning"
+    if crossing_level == "Critical":
+        risk_level = "Critical"
+    elif crossing_level == "Warning" and risk_level != "Critical":
+        risk_level = "Warning"
+    confidence_pct = int(np.clip(90 - sigma * 6 + min(8, len(values) // 4), 35, 96))
+    predicted_failure_time = crossing_time.strftime("%I:%M:%S %p") if crossing_time else "No breach predicted"
+    return {
+        "metric": metric,
+        "forecast_times": future_times,
+        "predicted": predicted,
+        "lower": lower,
+        "upper": upper,
+        "risk_level": risk_level,
+        "confidence_pct": confidence_pct,
+        "predicted_failure_time": predicted_failure_time,
+        "warning_threshold": warning_threshold,
+        "critical_threshold": critical_threshold,
+        "history_ts": ts_list,
+        "history_values": values.tolist(),
+    }
+
+
+def build_future_prediction_chart(forecast, metric_name, units, color):
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=forecast["history_ts"],
+            y=forecast["history_values"],
+            mode="lines+markers",
+            name="Actual",
+            line=dict(color="#38bdf8", width=3),
+            marker=dict(size=4, color="#38bdf8"),
+            hovertemplate="%{x}<br>Actual: %{y:.2f}"
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=forecast["forecast_times"],
+            y=forecast["predicted"],
+            mode="lines",
+            name="Predicted",
+            line=dict(color=color, width=3, dash="dash"),
+            hovertemplate="%{x}<br>Forecast: %{y:.2f}"
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=list(forecast["forecast_times"]) + list(reversed(forecast["forecast_times"])),
+            y=list(forecast["upper"]) + list(reversed(forecast["lower"])),
+            fill="toself",
+            fillcolor="rgba(59,130,246,0.18)",
+            line=dict(color="rgba(255,255,255,0)"),
+            hoverinfo="skip",
+            showlegend=True,
+            name="Confidence band",
+        )
+    )
+    if forecast["warning_threshold"] is not None:
+        fig.add_hline(
+            y=forecast["warning_threshold"],
+            line=dict(color="#f59e0b", dash="dot"),
+            annotation_text="Warning threshold",
+            annotation_position="top left",
+            annotation_font=dict(color="#f59e0b"),
+        )
+    if forecast["critical_threshold"] is not None:
+        fig.add_hline(
+            y=forecast["critical_threshold"],
+            line=dict(color="#ef4444", dash="dot"),
+            annotation_text="Critical threshold",
+            annotation_position="bottom left",
+            annotation_font=dict(color="#ef4444"),
+        )
+    fig.add_annotation(
+        x=forecast["forecast_times"][-1],
+        y=forecast["predicted"][-1],
+        text=f"{forecast['risk_level']} • {forecast['confidence_pct']}% confidence",
+        showarrow=False,
+        bgcolor="rgba(15,23,42,0.85)",
+        bordercolor="#475569",
+        borderwidth=1,
+        font=dict(color="#e2e8f0", size=12),
+        xanchor="right",
+        yanchor="bottom",
+    )
+    fig.update_layout(
+        title=f"{metric_name} Condition Forecast",
+        xaxis_title="Time",
+        yaxis_title=f"{metric_name} {units}",
+        showlegend=True,
+    )
+    style_plotly_chart(fig)
+    return fig
 
 
 def render_dashboard():
@@ -256,6 +645,16 @@ def render_dashboard():
       .kpi-label{color:#94a3b8;font-size:12px;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:8px}
       .kpi-value{font-size:26px;font-weight:700;color:#f8fafc}
       .kpi-delta{color:#34d399;font-size:12px;margin-top:6px}
+      .exec-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:20px}
+      .exec-card{background:linear-gradient(135deg,#111827,#1f2937);border:1px solid rgba(148,163,184,0.18);border-radius:18px;padding:20px;box-shadow:0 16px 34px rgba(15,23,42,0.35);min-height:140px;position:relative;overflow:hidden}
+      .exec-label{color:#94a3b8;font-size:11px;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:10px;display:block}
+      .exec-value{font-size:32px;font-weight:800;color:#f8fafc;line-height:1.1}
+      .exec-note{color:#cbd5e1;font-size:12px;margin-top:10px}
+      .exec-pill{display:inline-flex;padding:6px 10px;border-radius:999px;font-size:12px;font-weight:700}
+      .pill-green{background:#134e4a;color:#bef264}
+      .pill-yellow{background:#713f12;color:#fde68a}
+      .pill-red{background:#7f1d1d;color:#fecaca}
+      .pill-blue{background:#1e3a8a;color:#bfdbfe}
       .robot-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:18px;margin-bottom:20px}
       .robot-card{background:#111827;border:1px solid rgba(148,163,184,0.12);border-radius:16px;padding:18px;min-height:160px;position:relative;overflow:hidden;transition:transform 0.2s ease}
       .robot-card:hover{transform:translateY(-4px)}
@@ -349,6 +748,57 @@ def render_dashboard():
         unsafe_allow_html=True,
     )
 
+    pred_alerts = predictive_assessment(horizon_seconds=prediction_horizon)
+    active_alerts = [r for r in st.session_state.robots if r["status"] != "Healthy"]
+    active_alert_count = len(active_alerts)
+    predicted_failures_count = len(pred_alerts)
+    prev_availability = st.session_state.avail_history[-2] if len(st.session_state.avail_history) >= 2 else None
+    prev_downtime_pct = st.session_state.downtime_pct_history[-2] if len(st.session_state.downtime_pct_history) >= 2 else None
+    prev_pred_failures = st.session_state.pred_failures_history[-2] if len(st.session_state.pred_failures_history) >= 2 else None
+    prev_active_alerts = st.session_state.active_alerts_history[-2] if len(st.session_state.active_alerts_history) >= 2 else None
+    avail_arrow = trend_arrow(availability, prev_availability, positive_good=True)
+    downtime_arrow = trend_arrow(downtime_pct, prev_downtime_pct, positive_good=False)
+    pred_failures_arrow = trend_arrow(predicted_failures_count, prev_pred_failures, positive_good=False)
+    active_alerts_arrow = trend_arrow(active_alert_count, prev_active_alerts, positive_good=False)
+    st.session_state.downtime_pct_history.append(downtime_pct)
+    st.session_state.pred_failures_history.append(predicted_failures_count)
+    st.session_state.active_alerts_history.append(active_alert_count)
+
+    st.markdown(
+        f"""
+    <div class='section-title'>
+      <h2>Executive Summary</h2>
+      <span>High-level operational KPIs for leadership review</span>
+    </div>
+    <div class='exec-grid'>
+      <div class='exec-card'><span class='exec-label'>Total Robots</span><div class='exec-value'>{total}</div><span class='exec-note'>Entire monitored fleet</span></div>
+      <div class='exec-card'><span class='exec-label'>Healthy Robots</span><div class='exec-value'>{healthy}</div><span class='exec-note'><span class='exec-pill pill-green'>Healthy {healthy/total*100:.0f}%</span></span></div>
+      <div class='exec-card'><span class='exec-label'>Warning Robots</span><div class='exec-value'>{warning}</div><span class='exec-note'><span class='exec-pill pill-yellow'>Review required</span></span></div>
+      <div class='exec-card'><span class='exec-label'>Critical Robots</span><div class='exec-value'>{critical}</div><span class='exec-note'><span class='exec-pill pill-red'>Immediate action</span></span></div>
+      <div class='exec-card'><span class='exec-label'>Availability %</span><div class='exec-value'>{availability:.1f}%</div><span class='exec-note'>{avail_arrow} uptime trend</span></div>
+      <div class='exec-card'><span class='exec-label'>MTBF</span><div class='exec-value'>{mtbf:.1f}</div><span class='exec-note'>{trend_arrow(mtbf, None, positive_good=True)} mean time between failures</span></div>
+      <div class='exec-card'><span class='exec-label'>Downtime %</span><div class='exec-value'>{downtime_pct:.2f}%</div><span class='exec-note'>{downtime_arrow} operational downtime</span></div>
+      <div class='exec-card'><span class='exec-label'>Predicted Failures</span><div class='exec-value'>{predicted_failures_count}</div><span class='exec-note'>{pred_failures_arrow} risk forecast</span></div>
+      <div class='exec-card'><span class='exec-label'>Active Alerts</span><div class='exec-value'>{active_alert_count}</div><span class='exec-note'>{active_alerts_arrow} live issues</span></div>
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
+    avg_health = float(np.mean([r["health_score"] for r in st.session_state.robots]))
+    gauge_cols = st.columns([1, 1, 1])
+    gauge_cols[0].plotly_chart(build_gauge("Average Fleet Health", avg_health, min_val=0, max_val=100, threshold=80, suffix=" pts", subtext="Aggregate robot wellness rating"), use_container_width=True)
+    gauge_cols[1].plotly_chart(build_gauge("Critical Load", critical / total * 100 if total else 0, min_val=0, max_val=100, threshold=20, suffix="%", subtext="% of robots in critical state"), use_container_width=True)
+    gauge_cols[2].plotly_chart(build_gauge("Downtime Risk", downtime_pct, min_val=0, max_val=20, threshold=5, suffix="%", subtext="Recent downtime exposure"), use_container_width=True)
+
+    st.markdown("### Fleet Risk Overview")
+    risk_cols = st.columns([1, 1.3])
+    risk_cols[0].plotly_chart(build_alarm_pie(st.session_state.robots), use_container_width=True)
+    risk_cols[1].plotly_chart(build_risk_ranking_chart(st.session_state.robots), use_container_width=True)
+
+    st.markdown("### Robot Health Bar Chart")
+    st.plotly_chart(build_robot_health_bar(st.session_state.robots), use_container_width=True)
+
     selected_robot = next(
         (r for r in st.session_state.robots if r["id"] == selected_robot_id),
         st.session_state.robots[0],
@@ -367,11 +817,17 @@ def render_dashboard():
     detail_cols = st.columns([1, 1, 1, 1])
     detail_cols[0].metric("Robot", selected_robot["id"])
     detail_cols[1].metric("Status", selected_robot["status"])
-    detail_cols[2].metric("Health Score", robot_health_score(selected_robot))
+    detail_cols[2].metric("Health Score", selected_robot["health_score"])
     detail_cols[3].metric("Prediction Horizon", f"{st.session_state.prediction_horizon}s")
     st.markdown(
         f"**Current readings:** Temp {selected_robot['temperature']:.1f}°C • Torque {selected_robot['torque']:.1f} • Vib {selected_robot['vibration']:.1f} • Speed {selected_robot['speed']:.0f}"
     )
+    st.markdown(
+        f"**Risk score:** {selected_robot['risk_score']} • **Failure probability:** {selected_robot['predicted_failure_probability']}%"
+    )
+
+    if selected_robot["status"] != "Healthy":
+        st.warning(f"Active AI rule triggers: {selected_robot['alert_summary']}")
 
     if selected_predictions:
         sp_cols = st.columns(3)
@@ -383,6 +839,31 @@ def render_dashboard():
                 delta=f"Threshold {pred['threshold']}",
                 help=f"Expected {metric} in {st.session_state.prediction_horizon}s: {pred['level']}",
             )
+
+        st.markdown("### AI Condition Forecast")
+        forecast_cols = st.columns(3)
+        forecast_specs = [
+            ("temperature", "Temperature", "C", "#f97316", 80, None),
+            ("torque", "Torque", "Nm", "#60a5fa", 85, None),
+            ("vibration", "Vibration", "mm/s", "#38bdf8", 70, None),
+        ]
+        for i, (metric, title, units, color, warning_thr, critical_thr) in enumerate(forecast_specs):
+            forecast = forecast_robot_metric(
+                selected_robot,
+                metric,
+                horizon_seconds=st.session_state.prediction_horizon,
+                warning_threshold=warning_thr,
+                critical_threshold=critical_thr,
+            )
+            if forecast:
+                forecast_cols[i].plotly_chart(build_future_prediction_chart(forecast, title, units, color), use_container_width=True)
+                forecast_cols[i].markdown(
+                    f"**Predicted failure:** {forecast['predicted_failure_time']}  \n"
+                    f"**Risk level:** {forecast['risk_level']}  \n"
+                    f"**Confidence:** {forecast['confidence_pct']}%"
+                )
+            else:
+                forecast_cols[i].info("Not enough history to generate a forecast yet.")
     else:
         st.info("Not enough history to predict the selected robot yet.")
 
@@ -392,13 +873,14 @@ def render_dashboard():
         key=lambda r: (0 if r["status"] == "Critical" else 1 if r["status"] == "Warning" else 2, -r["temperature"]),
     )[:8]
     for r in sorted_robots:
-        score = robot_health_score(r)
+        score = r["health_score"]
         robot_cards.append(
             f"""
       <div class='robot-card'>
         <div class='robot-title'>{r['id']}</div>
         <div class='robot-score'>{score}</div>
         <div class='robot-status status-{r['status']}'>{r['status']}</div>
+        <div class='robot-meta'>Risk: {r['risk_score']} &bull; Failure: {r['predicted_failure_probability']}%<br>{r['alert_summary']}</div>
         <div class='robot-meta'>Temp: {r['temperature']:.1f}°C • Torque: {r['torque']:.1f} • Vib: {r['vibration']:.1f}</div>
       </div>
       """
@@ -457,51 +939,68 @@ def render_dashboard():
     """,
         unsafe_allow_html=True,
     )
-    col1, col2 = st.columns(2)
-    ts = list(st.session_state.ts_history)
-    if not ts:
-        # create initial from robot histories
-        ts = [r["history"]["ts"][-1] for r in st.session_state.robots][:HISTORY_LENGTH]
 
-    with col1:
-        ts = list(st.session_state.ts_history)
-        avail = list(st.session_state.avail_history)
-        health = list(st.session_state.health_history)
-        # ensure matching lengths
-        n_avail = min(len(ts), len(avail))
-        if n_avail > 0:
-            df_avail = pd.DataFrame({"ts": ts[-n_avail:], "availability": avail[-n_avail:]})
-            fig_temp = px.line(df_avail, x="ts", y="availability", labels={"ts": "Time", "availability": "Availability %"}, title="Availability % Over Time")
-            st.plotly_chart(fig_temp, use_container_width=True)
+    ts = list(st.session_state.ts_history)
+    downtime_history = list(st.session_state.downtime_pct_history)
+    avail = list(st.session_state.avail_history)
+    health = list(st.session_state.health_history)
+
+    trend_col_1, trend_col_2 = st.columns(2)
+    with trend_col_1:
+        if ts and avail:
+            fig_avail = build_metric_trend_chart(ts, avail, "Availability", "Availability %", "#22c55e")
+            fig_avail.update_layout(title_text="Availability % Over Time")
+            st.plotly_chart(fig_avail, use_container_width=True)
         else:
             st.info("Availability history not yet available")
 
-        n_health = min(len(ts), len(health))
-        if n_health > 0:
-            df_health = pd.DataFrame({"ts": ts[-n_health:], "health": health[-n_health:]})
-            fig_health = px.line(df_health, x="ts", y="health", labels={"ts": "Time", "health": "Health Score"}, title="Health Score Over Time")
+        if ts and health:
+            fig_health = build_metric_trend_chart(ts, health, "Health Score", "Health Score", "#38bdf8")
+            fig_health.update_layout(title_text="Health Score Over Time")
             st.plotly_chart(fig_health, use_container_width=True)
         else:
             st.info("Health history not yet available")
 
-    with col2:
-        # Aggregated metric trends: compute per-timestamp averages across robots
+    with trend_col_2:
+        if ts and downtime_history:
+            fig_downtime = build_downtime_trend(ts, downtime_history)
+            st.plotly_chart(fig_downtime, use_container_width=True)
+        else:
+            st.info("Downtime trend history not yet available")
+
         if len(st.session_state.ts_history) > 0:
             L = len(st.session_state.ts_history)
             temps_series = [np.mean([r["history"]["temperature"][i] for r in st.session_state.robots]) for i in range(L)]
             torque_series = [np.mean([r["history"]["torque"][i] for r in st.session_state.robots]) for i in range(L)]
             vib_series = [np.mean([r["history"]["vibration"][i] for r in st.session_state.robots]) for i in range(L)]
-            df_metrics = pd.DataFrame({"ts": list(st.session_state.ts_history), "avg_temp": temps_series, "avg_torque": torque_series, "avg_vib": vib_series})
-            fig_metrics = px.line(df_metrics, x="ts", y=["avg_temp", "avg_torque", "avg_vib"], labels={"ts": "Time"}, title="Avg Temp / Torque / Vibration Over Time")
+            fig_metrics = px.line(
+                pd.DataFrame({"ts": list(st.session_state.ts_history), "Avg Temp": temps_series, "Avg Torque": torque_series, "Avg Vib": vib_series}),
+                x="ts",
+                y=["Avg Temp", "Avg Torque", "Avg Vib"],
+                labels={"ts": "Time"},
+                title="Avg Temp / Torque / Vibration Over Time",
+            )
+            fig_metrics.update_traces(mode="lines+markers", hovertemplate="%{x}<br>%{y:.2f}")
+            style_plotly_chart(fig_metrics)
             st.plotly_chart(fig_metrics, use_container_width=True)
         else:
-            # show current snapshot as fallback
             curr_avg_temp = np.mean([r["temperature"] for r in st.session_state.robots])
             curr_avg_torque = np.mean([r["torque"] for r in st.session_state.robots])
             curr_avg_vib = np.mean([r["vibration"] for r in st.session_state.robots])
             df_now = pd.DataFrame({"metric": ["Avg Temp", "Avg Torque", "Avg Vib"], "value": [curr_avg_temp, curr_avg_torque, curr_avg_vib]})
             fig_now = px.bar(df_now, x="metric", y="value", title="Current Aggregated Metrics")
+            style_plotly_chart(fig_now)
             st.plotly_chart(fig_now, use_container_width=True)
+
+    metric_cols = st.columns(3)
+    if ts:
+        metric_cols[0].plotly_chart(build_metric_trend_chart(ts, [np.mean([r["history"]["temperature"][i] for r in st.session_state.robots]) for i in range(len(ts))], "Temperature", "Temperature °C", "#f97316"), use_container_width=True)
+        metric_cols[1].plotly_chart(build_metric_trend_chart(ts, [np.mean([r["history"]["torque"][i] for r in st.session_state.robots]) for i in range(len(ts))], "Torque", "Torque", "#38bdf8"), use_container_width=True)
+        metric_cols[2].plotly_chart(build_metric_trend_chart(ts, [np.mean([r["history"]["vibration"][i] for r in st.session_state.robots]) for i in range(len(ts))], "Vibration", "Vibration", "#60a5fa"), use_container_width=True)
+    else:
+        metric_cols[0].info("Temperature history loading...")
+        metric_cols[1].info("Torque history loading...")
+        metric_cols[2].info("Vibration history loading...")
 
     # Active alerts panel
     st.markdown(
@@ -516,7 +1015,15 @@ def render_dashboard():
     alerts = [r for r in st.session_state.robots if r["status"] != "Healthy"]
     if alerts:
         for r in sorted(alerts, key=lambda x: (x['status'] != 'Critical', -x['temperature'])):
-            st.warning(f"{r['id']} — {r['status']}: Temp={r['temperature']:.1f}°C, Torque={r['torque']:.1f}, Vib={r['vibration']:.1f}")
+            st.caption(f"AI triggers: {r['alert_summary']} | Health {r['health_score']} | Risk {r['risk_score']} | Failure {r['predicted_failure_probability']}%")
+            if r['status'] == 'Critical':
+                st.error(
+                    f"{r['id']} — {r['status']}: Temp={r['temperature']:.1f}°C, Torque={r['torque']:.1f}, Vib={r['vibration']:.1f} • Risk {r['risk_score']} • Failure {r['predicted_failure_probability']}%"
+                )
+            else:
+                st.warning(
+                    f"{r['id']} — {r['status']}: Temp={r['temperature']:.1f}°C, Torque={r['torque']:.1f}, Vib={r['vibration']:.1f} • Risk {r['risk_score']} • Failure {r['predicted_failure_probability']}%"
+                )
     else:
         st.success("No active alerts — all robots healthy")
 
@@ -568,7 +1075,10 @@ def render_dashboard():
                 "Temp (°C)": f"{r['temperature']:.1f}",
                 "Torque": f"{r['torque']:.1f}",
                 "Vib": f"{r['vibration']:.1f}",
-                "Health": robot_health_score(r),
+                "Health": r["health_score"],
+                "Risk Score": r["risk_score"],
+                "Failure Prob %": f"{r['predicted_failure_probability']}%",
+                "AI Rule Triggers": r["alert_summary"],
                 "Predicted Risk": ", ".join(prediction_map.get(r["id"], [])) or "None",
                 "StatusOrder": status_order.get(r["status"], 3),
             }
